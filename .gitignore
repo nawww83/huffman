@@ -1,0 +1,39 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+
+# Binaries / objects
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.so
+*.so.*
+*.dylib
+
+# Editors / IDEs
+.vs/
+.vscode/
+.idea/
+*.user
+*.user.*
+CMakeLists.txt.user*
+
+# Misc
+*.log
+shortcut
