@@ -213,6 +213,28 @@ int run_benchmark(const bench_options& options)
         payload_ns = std::min(payload_ns, watch.elapsed_ns());
     }
 
+    // Decoding, also best of `best_repetitions` on the last input. The payload
+    // is decoded into a reused buffer, so its allocation is not timed; the
+    // container run pays for the output allocation, the header and the model
+    // rebuild as well.
+    const huffman::histogram last_freq = huffman::count_frequencies(input_span);
+    const huffman::code_table last_table = huffman::build_code_table(last_freq);
+    const std::vector<std::uint8_t> container = huffman::compress(input_span);
+    const std::span<const std::uint8_t> payload =
+        std::span<const std::uint8_t>{container}.subspan(huffman::container_header_size(last_table.symbols));
+    std::vector<std::uint8_t> restored;
+    double decode_ns = 1e300;
+    double decompress_ns = 1e300;
+    for (int i = 0; i < best_repetitions; ++i) {
+        watch.restart();
+        huffman::decode_payload(last_table, payload, input.size(), restored);
+        decode_ns = std::min(decode_ns, watch.elapsed_ns());
+
+        watch.restart();
+        restored = huffman::decompress(container);
+        decompress_ns = std::min(decompress_ns, watch.elapsed_ns());
+    }
+
     const double bytes = static_cast<double>(input.size());
     const auto report = [&](const char* name, double ns, bool rate) {
         std::cout << "  " << name << "  " << ns * 1e-6 << " ms";
@@ -225,6 +247,10 @@ int run_benchmark(const bench_options& options)
     report("histogram", histogram_ns, true);
     report("model    ", model_ns, false);
     report("payload  ", payload_ns, true);
+
+    std::cout << "Decode (best of " << best_repetitions << " on the last input):\n";
+    report("payload  ", decode_ns, true);
+    report("container", decompress_ns, true);
 
     return 0;
 }
