@@ -122,6 +122,54 @@ void check_table(const huffman::code_table& table, const char* what, const char*
 
 #define CHECK_TABLE(table, what) check_table((table), (what), __FILE__, __LINE__)
 
+/// Straightforward bit-by-bit canonical decoder. It shares no code with the
+/// table-driven decoder under test, so it works as an oracle for it: in
+/// particular for the packed multi-symbol entries and for the tail.
+[[nodiscard]] std::vector<std::uint8_t> reference_decode(const huffman::code_table& table,
+                                                        std::span<const std::uint8_t> payload,
+                                                        std::size_t symbol_count)
+{
+    std::array<std::uint8_t, huffman::alphabet_size> order{};
+    std::array<std::uint32_t, huffman::alphabet_size + 1> count{};
+    std::size_t next = 0;
+    for (unsigned len = 1; len <= table.max_len; ++len) {
+        for (std::size_t byte = 0; byte < huffman::alphabet_size; ++byte) {
+            if (table.len[byte] == len) {
+                order[next++] = static_cast<std::uint8_t>(byte);
+                ++count[len];
+            }
+        }
+    }
+
+    const std::size_t total_bits = payload.size() * 8u;
+    std::vector<std::uint8_t> out;
+    out.reserve(symbol_count);
+
+    std::size_t bit = 0;
+    for (std::size_t symbol = 0; symbol < symbol_count; ++symbol) {
+        std::uint32_t code = 0;
+        std::uint32_t first = 0;
+        std::size_t index = 0;
+        bool found = false;
+        for (unsigned len = 1; len <= table.max_len; ++len) {
+            const bool one = bit < total_bits && ((payload[bit >> 3] >> (7u - (bit & 7u))) & 1u) != 0u;
+            ++bit;
+            code = (code << 1u) | (one ? 1u : 0u);
+            if (code - first < count[len]) {
+                out.push_back(order[index + (code - first)]);
+                found = true;
+                break;
+            }
+            index += count[len];
+            first = (first + count[len]) << 1u;
+        }
+        if (!found) {
+            break; // the bit stream is not a code word; the caller notices the short result
+        }
+    }
+    return out;
+}
+
 // ------------------------------------------------------------- round tripping
 
 [[nodiscard]] bool same_bytes(std::span<const std::uint8_t> lhs, std::span<const std::uint8_t> rhs)
@@ -528,6 +576,139 @@ void test_sizes_and_padding()
     }
 }
 
+void test_decode_matches_reference()
+{
+    std::mt19937 engine{0xDEC0DE};
+
+    // The decoder has three regimes that must agree with the oracle: entries
+    // that carry several symbols, entries that carry one, and the tail (last
+    // symbols and last payload bytes). Sizes 0..40 step through all of them.
+    std::vector<std::size_t> sizes;
+    for (std::size_t size = 0; size <= 40; ++size) {
+        sizes.push_back(size);
+    }
+    for (const std::size_t size : {63u, 64u, 65u, 127u, 128u, 255u, 1000u, 5000u}) {
+        sizes.push_back(size);
+    }
+
+    for (const std::size_t size : sizes) {
+        for (const shape kind : all_shapes) {
+            const std::vector<std::uint8_t> input = make_input(kind, size, engine);
+            const huffman::code_table table = huffman::build_code_table(huffman::count_frequencies(input));
+            const std::size_t bits = huffman::encoded_bits(table, input);
+
+            std::vector<std::uint8_t> payload;
+            huffman::encode_payload(table, input, bits, payload);
+
+            std::vector<std::uint8_t> decoded;
+            huffman::decode_payload(table, payload, input.size(), decoded);
+
+            const std::vector<std::uint8_t> oracle = reference_decode(table, payload, input.size());
+            const bool ok = oracle == input && decoded == oracle;
+            ++g_checks;
+            if (!ok) {
+                ++g_failures;
+                std::printf("  FAIL %s:%d: decoder disagrees with the reference [%s, %zu bytes]\n", __FILE__,
+                            __LINE__, name_of(kind), size);
+            }
+        }
+    }
+
+    // Codes longer than the root table: every such symbol goes through the
+    // bit-by-bit walk in the middle of a packed stream. Fibonacci counts give
+    // the deepest tree the length limit allows, and the table is then used to
+    // encode an input that is small enough for a test.
+    {
+        huffman::histogram freq{};
+        std::uint64_t previous = 1;
+        std::uint64_t current = 1;
+        for (std::size_t symbol = 0; symbol < 40; ++symbol) {
+            freq[symbol] = previous;
+            const std::uint64_t next = previous + current;
+            previous = current;
+            current = next;
+        }
+        const huffman::code_table table = huffman::build_code_table(freq);
+        CHECK(table.max_len > 12u);
+        CHECK_TABLE(table, "fibonacci table");
+
+        std::vector<std::uint8_t> input;
+        input.reserve(4096);
+        for (std::size_t i = 0; i < 4000; ++i) {
+            input.push_back(static_cast<std::uint8_t>(i % 40u));
+        }
+        std::vector<std::uint8_t> payload;
+        huffman::encode_payload(table, input, payload);
+        std::vector<std::uint8_t> decoded;
+        huffman::decode_payload(table, payload, input.size(), decoded);
+        CHECK(decoded == input);
+        CHECK(reference_decode(table, payload, input.size()) == input);
+    }
+
+    // Every symbol of a full alphabet: 256 codes of eight bits, the maximum
+    // number of distinct entries a root table can hold.
+    {
+        std::vector<std::uint8_t> input;
+        for (unsigned value = 0; value < 256; ++value) {
+            input.push_back(static_cast<std::uint8_t>(value));
+        }
+        const std::vector<std::uint8_t> block = input;
+        for (unsigned repeat = 0; repeat < 64; ++repeat) {
+            input.insert(input.end(), block.begin(), block.end());
+        }
+        const huffman::code_table table = huffman::build_code_table(huffman::count_frequencies(input));
+        CHECK_EQ(table.max_len, 8u);
+        std::vector<std::uint8_t> payload;
+        huffman::encode_payload(table, input, payload);
+        std::vector<std::uint8_t> decoded;
+        huffman::decode_payload(table, payload, input.size(), decoded);
+        CHECK(decoded == input);
+        CHECK(reference_decode(table, payload, input.size()) == input);
+    }
+}
+
+void test_decode_rejects_incomplete_code()
+{
+    const auto throws = [](const huffman::code_table& table, std::span<const std::uint8_t> payload,
+                           std::size_t symbols) {
+        try {
+            std::vector<std::uint8_t> out;
+            huffman::decode_payload(table, payload, symbols, out);
+            return false;
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+    };
+
+    // An incomplete (Kraft sum < 1) code: 26 symbols of five bits leave most
+    // bit patterns without a code word, so 0xFF cannot be decoded.
+    huffman::histogram freq{};
+    for (std::size_t symbol = 0; symbol < 26; ++symbol) {
+        freq['a' + symbol] = 1;
+    }
+    huffman::code_table table = huffman::build_code_table(freq);
+    table.len.fill(0); // rebuild by hand: a deliberately incomplete code
+    for (std::size_t symbol = 0; symbol < 26; ++symbol) {
+        table.len['a' + symbol] = 5;
+    }
+    table.symbols = 26;
+    huffman::assign_canonical_codes(table);
+    CHECK_EQ(table.max_len, 5u);
+
+    const std::vector<std::uint8_t> garbage(64, 0xFF);
+    // The tail path and the packed-entry path must both give up instead of
+    // reading past the end of the payload.
+    CHECK(throws(table, garbage, 3));
+    CHECK(throws(table, garbage, 300));
+    CHECK(throws(table, garbage, 1));
+
+    // A bit pattern that is a code word still decodes.
+    const std::vector<std::uint8_t> valid(64, 0x00); // 00000 -> the first symbol
+    std::vector<std::uint8_t> out;
+    huffman::decode_payload(table, valid, 100, out);
+    CHECK_EQ(out.size(), 100u);
+}
+
 void test_random_fuzz()
 {
     std::mt19937 engine{0xC0FFEE};
@@ -629,13 +810,15 @@ void test_rejects_bad_input()
 
 int main()
 {
-    const std::array<std::pair<const char*, void (*)()>, 9> tests{{
+    const std::array<std::pair<const char*, void (*)()>, 11> tests{{
         {"bit stream round trip", test_bit_stream_round_trip},
         {"canonical codes", test_canonical_codes},
         {"code table invariants", test_code_table_invariants},
         {"length limited codes", test_length_limited_codes},
         {"degenerate alphabet", test_degenerate_alphabet},
         {"sizes and padding", test_sizes_and_padding},
+        {"decode matches reference", test_decode_matches_reference},
+        {"decode rejects incomplete code", test_decode_rejects_incomplete_code},
         {"random fuzz", test_random_fuzz},
         {"container round trip", test_container_round_trip},
         {"rejects bad input", test_rejects_bad_input},

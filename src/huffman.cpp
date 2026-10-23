@@ -221,24 +221,43 @@ private:
     std::size_t max_len_{0};
 };
 
-/// Single-level lookup table for canonical decoding.
+/// Multi-symbol lookup table for canonical decoding.
 ///
-/// Indexed by the next `root_bits_` bits of the stream, each entry packs as
-/// `(length << 8) | byte`. A zero entry means no code of at most `root_bits_`
-/// bits starts with that prefix, so the symbol goes through the bit-by-bit
-/// walk. For byte data that happens for a small percentage of symbols at most.
+/// Indexed by the next `root_bits_` bits of the stream. One entry packs every
+/// complete code word that fits into those bits, up to `packed_symbols`:
+///
+///     bytes 0..5   symbols 0..5
+///     bits 48..52  bits consumed by those symbols
+///     bits 53..55  number of symbols stored (1..6)
+///
+/// A zero entry means no code word starts with that prefix (the symbol is
+/// longer than `root_bits_`) and goes through the bit-by-bit walk, which also
+/// rejects prefixes that are not code words at all.
+///
+/// Packing matters because the loop is bound by the dependency chain "load the
+/// entry -> shift the window -> index the table": one L1 latency is paid per
+/// *entry*, not per symbol. On little-endian the whole entry is also stored into
+/// the output with a single 8-byte write, and the bytes past the symbols are
+/// simply overwritten by the next entry.
 class decode_table {
 public:
-    static constexpr unsigned max_root_bits = 12; ///< 8 KiB, comfortably in L1
+    static constexpr unsigned max_root_bits = 12; ///< 32 KiB, still cache friendly
+    /// A tiny alphabet would shrink the root to a few bits and with it the
+    /// number of symbols packed into one entry. Eight bits cost 2 KiB and keep
+    /// even a four-symbol code near six symbols per entry.
+    static constexpr unsigned min_root_bits = 8;
+    static constexpr unsigned packed_symbols = 6;
 
     explicit decode_table(const code_table& table)
-        : root_bits_{std::min<unsigned>(table.max_len, max_root_bits)}
+        : root_bits_{std::clamp<unsigned>(table.max_len, min_root_bits, max_root_bits)}
         , walker_{table}
     {
         code_table coded = table;
         assign_canonical_codes(coded);
 
-        table_.assign(std::size_t{1} << root_bits_, 0);
+        // First the plain one-symbol table: index -> (length << 8) | symbol.
+        const std::size_t entries = std::size_t{1} << root_bits_;
+        std::vector<std::uint16_t> single(entries, 0);
         for (std::size_t byte = 0; byte < alphabet_size; ++byte) {
             const unsigned len = coded.len[byte];
             if (len == 0u || len > root_bits_) {
@@ -249,8 +268,35 @@ public:
             const unsigned base = coded.code[byte] << shift;
             const unsigned span = 1u << shift;
             for (unsigned k = 0; k < span; ++k) {
-                table_[base + k] = entry;
+                single[base + k] = entry;
             }
+        }
+
+        // Then chain it onto itself: after the first symbol the next one starts
+        // at the same kind of prefix, shifted by the bits already consumed.
+        const auto mask = static_cast<std::uint32_t>(entries - 1u);
+        table_.resize(entries);
+        for (std::size_t index = 0; index < entries; ++index) {
+            std::uint64_t packed = 0;
+            unsigned consumed = 0;
+            unsigned count = 0;
+            auto prefix = static_cast<std::uint32_t>(index);
+            while (count < packed_symbols) {
+                const std::uint16_t code = single[prefix];
+                const unsigned len = code >> 8u;
+                if (len == 0u || consumed + len > root_bits_) {
+                    break;
+                }
+                packed |= std::uint64_t{code & 0xFFu} << (8u * count);
+                consumed += len;
+                ++count;
+                prefix = (prefix << len) & mask;
+            }
+            if (count != 0u) {
+                packed |= std::uint64_t{consumed} << length_shift;
+                packed |= std::uint64_t{count} << symbols_shift;
+            }
+            table_[index] = packed;
         }
     }
 
@@ -264,7 +310,7 @@ public:
         const std::uint8_t* data = payload.data();
         const std::size_t size = payload.size();
         const std::size_t total_bits = size * 8u;
-        const std::uint16_t* table = table_.data();
+        const std::uint64_t* table = table_.data();
         const unsigned root_shift = 64u - root_bits_;
         std::uint8_t* dst = out.data();
         std::uint8_t* const end = dst + out.size();
@@ -279,7 +325,7 @@ public:
 
         // Topped up with unaligned 8-byte loads while at least 8 bytes of the
         // payload remain. The splice always leaves `fill >= 57`, which covers
-        // the longest code (32 bits) plus the table index (12 bits).
+        // the widest entry (12 bits) several times over.
         const auto refill = [&] {
             std::uint64_t word;
             std::memcpy(&word, data + pos, sizeof(word));
@@ -292,68 +338,56 @@ public:
             fill = 64u - ((64u - fill) & 7u);
         };
 
-        // Realigns the window after a slow walk, which may consume an
-        // arbitrary number of bits.
-        const auto resync = [&](std::size_t bit) {
-            window = bit_window(data, size, bit);
-            fill = 64u - static_cast<unsigned>(bit & 7u);
-            pos = (bit >> 3) + 8u;
-        };
-
-        const auto consume = [&](std::uint16_t entry) {
-            *dst++ = static_cast<std::uint8_t>(entry);
-            const unsigned len = entry >> 8;
-            window <<= len;
-            fill -= len;
-        };
-
-        // Fast phase: the window can be spliced from a full 8-byte load. Two
-        // symbols are taken per pass when the second one is already inside the
-        // window, which halves the loop overhead.
-        while (dst != end && pos + 8u <= size) {
+        // Fast phase: eight payload bytes in the window and eight bytes of
+        // output headroom (the width of one whole entry) mean the entry can be
+        // written with a single store and no branch on how many symbols it
+        // carries.
+        while (static_cast<std::size_t>(end - dst) >= sizeof(std::uint64_t) && pos + 8u <= size) {
             if (fill < 57u) {
                 refill();
             }
-            const std::uint16_t entry = table[window >> root_shift];
+            const std::uint64_t entry = table[window >> root_shift];
             if (entry == 0u) {
                 std::size_t bit = pos * 8u - fill;
                 *dst++ = walker_.next(data, total_bits, bit);
-                resync(bit);
+                window = bit_window(data, size, bit);
+                fill = 64u - static_cast<unsigned>(bit & 7u);
+                pos = (bit >> 3) + 8u;
                 continue;
             }
-            consume(entry);
-            if (dst != end && fill >= root_bits_) {
-                const std::uint16_t next_entry = table[window >> root_shift];
-                if (next_entry != 0u) {
-                    consume(next_entry);
+            if constexpr (std::endian::native == std::endian::little) {
+                // The symbols sit in the low bytes, so the memory image of the
+                // entry is exactly the output; the length and the count land in
+                // the bytes after them and are overwritten by the next entry.
+                std::memcpy(dst, &entry, sizeof(entry));
+            } else {
+                for (unsigned k = 0; k < packed_symbols; ++k) {
+                    dst[k] = static_cast<std::uint8_t>(entry >> (8u * k));
                 }
             }
+            const unsigned bits = static_cast<unsigned>((entry >> length_shift) & length_mask);
+            dst += entry >> symbols_shift;
+            window <<= bits;
+            fill -= bits;
         }
 
-        // Tail phase: fewer than 8 bytes left, so top up byte by byte and let
-        // bits past the end read as zero.
+        // Tail: the last symbols, or the last payload bytes. No code is shorter
+        // than one bit, so eight trailing bytes cover at most 64 symbols; the
+        // walk is exact, reads past the end as zero and takes any bit offset.
+        std::size_t bit = pos * 8u - fill;
         while (dst != end) {
-            while (fill <= 56u) {
-                const std::uint64_t byte = pos < size ? data[pos] : 0u;
-                ++pos;
-                window |= byte << (56u - fill);
-                fill += 8u;
-            }
-            const std::uint16_t entry = table[window >> root_shift];
-            if (entry != 0u) {
-                consume(entry);
-            } else {
-                std::size_t bit = pos * 8u - fill;
-                *dst++ = walker_.next(data, total_bits, bit);
-                resync(bit);
-            }
+            *dst++ = walker_.next(data, total_bits, bit);
         }
     }
 
 private:
+    static constexpr unsigned length_shift = 48;
+    static constexpr std::uint64_t length_mask = 0x1Fu;
+    static constexpr unsigned symbols_shift = 53;
+
     unsigned root_bits_{0};
     canonical_walk walker_;
-    std::vector<std::uint16_t> table_;
+    std::vector<std::uint64_t> table_;
 };
 
 } // namespace
