@@ -3,7 +3,9 @@
 #include "huffman/bit_stream.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
+#include <cstring>
 #include <iterator>
 #include <queue>
 #include <stdexcept>
@@ -136,6 +138,223 @@ void assign_flat_lengths(const histogram& freq, std::array<std::uint8_t, alphabe
         }
     }
 }
+
+// ---------------------------------------------------------------- decode tables
+
+/// Byte swap used by the look-ahead window.
+[[nodiscard]] inline std::uint64_t swap_u64(std::uint64_t value) noexcept
+{
+#if defined(_MSC_VER)
+    return _byteswap_uint64(value);
+#else
+    return __builtin_bswap64(value);
+#endif
+}
+
+/// The 64 bits starting at bit `bit`, most significant bit first. Bits past the
+/// end of the payload read as zero, so the tail needs no special case.
+[[nodiscard]] inline std::uint64_t bit_window(const std::uint8_t* data,
+                                              std::size_t size,
+                                              std::size_t bit) noexcept
+{
+    const std::size_t byte = bit >> 3;
+    std::uint64_t word = 0;
+    if (byte < size) {
+        const std::size_t available = size - byte;
+        const std::size_t taken = available < sizeof(word) ? available : sizeof(word);
+        std::memcpy(&word, data + byte, taken);
+    }
+    if constexpr (std::endian::native == std::endian::little) {
+        word = swap_u64(word);
+    }
+    return word << (bit & 7u);
+}
+
+/// Walks canonical code words one bit at a time, in the `(length, symbol)` order
+/// the encoder assigns codes in. `bit` carries the stream position in and out,
+/// so a walk can start in the middle of a payload.
+///
+/// Used for codes longer than the lookup table's root bits, and to reject bit
+/// patterns that are not code words at all.
+class canonical_walk {
+public:
+    explicit canonical_walk(const code_table& table)
+        : max_len_{table.max_len}
+    {
+        for (std::size_t len = 1; len <= table.max_len; ++len) {
+            for (std::size_t byte = 0; byte < alphabet_size; ++byte) {
+                if (table.len[byte] == len) {
+                    symbols_[next_++] = static_cast<std::uint8_t>(byte);
+                    ++count_[len];
+                }
+            }
+        }
+    }
+
+    /// Decodes one symbol from `bit` and advances it. Throws if the bits do not
+    /// form a code word; bits past `total_bits` read as zero.
+    [[nodiscard]] std::uint8_t next(const std::uint8_t* data,
+                                    std::size_t total_bits,
+                                    std::size_t& bit) const
+    {
+        std::uint32_t code = 0;
+        std::uint32_t first = 0;
+        std::size_t index = 0;
+        for (std::size_t len = 1; len <= max_len_; ++len) {
+            const bool one = bit < total_bits &&
+                             ((data[bit >> 3] >> (7u - (bit & 7u))) & 1u) != 0u;
+            ++bit;
+            code = (code << 1u) | (one ? 1u : 0u);
+            if (code - first < count_[len]) {
+                return symbols_[index + (code - first)];
+            }
+            index += count_[len];
+            first = (first + count_[len]) << 1u;
+        }
+        throw std::runtime_error("huffman: payload does not form a valid code word");
+    }
+
+private:
+    std::array<std::uint8_t, alphabet_size> symbols_{};
+    std::array<std::uint32_t, alphabet_size> count_{};
+    std::size_t next_{0};
+    std::size_t max_len_{0};
+};
+
+/// Single-level lookup table for canonical decoding.
+///
+/// Indexed by the next `root_bits_` bits of the stream, each entry packs as
+/// `(length << 8) | byte`. A zero entry means no code of at most `root_bits_`
+/// bits starts with that prefix, so the symbol goes through the bit-by-bit
+/// walk. For byte data that happens for a small percentage of symbols at most.
+class decode_table {
+public:
+    static constexpr unsigned max_root_bits = 12; ///< 8 KiB, comfortably in L1
+
+    explicit decode_table(const code_table& table)
+        : root_bits_{std::min<unsigned>(table.max_len, max_root_bits)}
+        , walker_{table}
+    {
+        code_table coded = table;
+        assign_canonical_codes(coded);
+
+        table_.assign(std::size_t{1} << root_bits_, 0);
+        for (std::size_t byte = 0; byte < alphabet_size; ++byte) {
+            const unsigned len = coded.len[byte];
+            if (len == 0u || len > root_bits_) {
+                continue;
+            }
+            const auto entry = static_cast<std::uint16_t>((len << 8) | byte);
+            const unsigned shift = root_bits_ - len;
+            const unsigned base = coded.code[byte] << shift;
+            const unsigned span = 1u << shift;
+            for (unsigned k = 0; k < span; ++k) {
+                table_[base + k] = entry;
+            }
+        }
+    }
+
+    /// Decodes exactly `symbol_count` symbols into `out`.
+    void decode(std::span<const std::uint8_t> payload,
+                std::uint64_t symbol_count,
+                std::vector<std::uint8_t>& out) const
+    {
+        out.resize(static_cast<std::size_t>(symbol_count));
+
+        const std::uint8_t* data = payload.data();
+        const std::size_t size = payload.size();
+        const std::size_t total_bits = size * 8u;
+        const std::uint16_t* table = table_.data();
+        const unsigned root_shift = 64u - root_bits_;
+        std::uint8_t* dst = out.data();
+        std::uint8_t* const end = dst + out.size();
+
+        // Left-aligned window: the next bit to decode is bit 63 of `window`,
+        // which carries `fill` valid bits (the rest are zero). `pos` is the
+        // next byte to load, and the absolute position of the next bit is
+        // always `pos * 8 - fill`.
+        std::size_t pos = 0;
+        std::uint64_t window = 0;
+        unsigned fill = 0;
+
+        // Topped up with unaligned 8-byte loads while at least 8 bytes of the
+        // payload remain. The splice always leaves `fill >= 57`, which covers
+        // the longest code (32 bits) plus the table index (12 bits).
+        const auto refill = [&] {
+            std::uint64_t word;
+            std::memcpy(&word, data + pos, sizeof(word));
+            if constexpr (std::endian::native == std::endian::little) {
+                word = swap_u64(word);
+            }
+            window |= word >> fill;
+            const unsigned step = (64u - fill) >> 3;
+            pos += step;
+            fill = 64u - ((64u - fill) & 7u);
+        };
+
+        // Realigns the window after a slow walk, which may consume an
+        // arbitrary number of bits.
+        const auto resync = [&](std::size_t bit) {
+            window = bit_window(data, size, bit);
+            fill = 64u - static_cast<unsigned>(bit & 7u);
+            pos = (bit >> 3) + 8u;
+        };
+
+        const auto consume = [&](std::uint16_t entry) {
+            *dst++ = static_cast<std::uint8_t>(entry);
+            const unsigned len = entry >> 8;
+            window <<= len;
+            fill -= len;
+        };
+
+        // Fast phase: the window can be spliced from a full 8-byte load. Two
+        // symbols are taken per pass when the second one is already inside the
+        // window, which halves the loop overhead.
+        while (dst != end && pos + 8u <= size) {
+            if (fill < 57u) {
+                refill();
+            }
+            const std::uint16_t entry = table[window >> root_shift];
+            if (entry == 0u) {
+                std::size_t bit = pos * 8u - fill;
+                *dst++ = walker_.next(data, total_bits, bit);
+                resync(bit);
+                continue;
+            }
+            consume(entry);
+            if (dst != end && fill >= root_bits_) {
+                const std::uint16_t next_entry = table[window >> root_shift];
+                if (next_entry != 0u) {
+                    consume(next_entry);
+                }
+            }
+        }
+
+        // Tail phase: fewer than 8 bytes left, so top up byte by byte and let
+        // bits past the end read as zero.
+        while (dst != end) {
+            while (fill <= 56u) {
+                const std::uint64_t byte = pos < size ? data[pos] : 0u;
+                ++pos;
+                window |= byte << (56u - fill);
+                fill += 8u;
+            }
+            const std::uint16_t entry = table[window >> root_shift];
+            if (entry != 0u) {
+                consume(entry);
+            } else {
+                std::size_t bit = pos * 8u - fill;
+                *dst++ = walker_.next(data, total_bits, bit);
+                resync(bit);
+            }
+        }
+    }
+
+private:
+    unsigned root_bits_{0};
+    canonical_walk walker_;
+    std::vector<std::uint16_t> table_;
+};
 
 } // namespace
 
@@ -311,40 +530,10 @@ void decode_payload(const code_table& table,
         return;
     }
 
-    // Decoding tables: symbols grouped by (length, symbol) and the number of
-    // codes of each length.
-    std::array<std::uint8_t, alphabet_size> symbols{};
-    std::array<std::uint32_t, alphabet_size> length_count{};
-    std::size_t next = 0;
-    for (std::size_t len = 1; len <= table.max_len; ++len) {
-        for (std::size_t byte = 0; byte < alphabet_size; ++byte) {
-            if (table.len[byte] == len) {
-                symbols[next++] = static_cast<std::uint8_t>(byte);
-                ++length_count[len];
-            }
-        }
-    }
-
-    bit_reader reader{payload};
-    for (std::uint64_t i = 0; i < symbol_count; ++i) {
-        std::uint32_t code = 0;
-        std::uint32_t first = 0;
-        std::size_t index = 0;
-        bool decoded = false;
-        for (std::size_t len = 1; len <= table.max_len; ++len) {
-            code = (code << 1u) | (reader.next_bit() ? 1u : 0u);
-            if (code - first < length_count[len]) {
-                out.push_back(symbols[index + (code - first)]);
-                decoded = true;
-                break;
-            }
-            index += length_count[len];
-            first = (first + length_count[len]) << 1u;
-        }
-        if (!decoded) {
-            throw std::runtime_error("huffman: payload does not form a valid code word");
-        }
-    }
+    // Table-driven fast path: one lookup for codes up to the root width, a
+    // bit-by-bit walk for the rare longer ones and for invalid patterns.
+    const decode_table table_for_decode{table};
+    table_for_decode.decode(payload, symbol_count, out);
 }
 
 std::vector<std::uint8_t> compress(std::span<const std::uint8_t> input)
